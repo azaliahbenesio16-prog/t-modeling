@@ -17,7 +17,7 @@ import matplotlib
 matplotlib.use("Agg")
 
 # ==============================
-# PAGE CONFIG (LIGHT + CLEAN)
+# PAGE CONFIG
 # ==============================
 st.set_page_config(
     page_title="Topic Modeling",
@@ -29,12 +29,24 @@ st.title("📊 Topic Modeling (LDA vs NMF)")
 st.caption("Minimal NLP Dashboard")
 
 # ==============================
-# NLTK SETUP
+# SAFE NLTK LOADER
 # ==============================
 @st.cache_resource
 def load_nltk():
-    nltk.download("punkt")
-    nltk.download("stopwords")
+    try:
+        nltk.data.find("tokenizers/punkt")
+    except LookupError:
+        nltk.download("punkt", quiet=True)
+
+    try:
+        nltk.data.find("tokenizers/punkt_tab")
+    except LookupError:
+        nltk.download("punkt_tab", quiet=True)
+
+    try:
+        nltk.data.find("corpora/stopwords")
+    except LookupError:
+        nltk.download("stopwords", quiet=True)
 
 load_nltk()
 
@@ -58,6 +70,11 @@ SAMPLE = {
 
 if uploaded:
     df = pd.read_csv(uploaded)
+
+    if "text" not in df.columns:
+        st.error("CSV must contain a 'text' column")
+        st.stop()
+
     documents = df["text"].dropna().tolist()
     st.success("Uploaded dataset loaded")
 else:
@@ -67,7 +84,7 @@ else:
 st.write(f"📄 Total Documents: {len(documents)}")
 
 # ==============================
-# PREPROCESSING + STOPWORDS
+# PREPROCESSING
 # ==============================
 stop_words = set(stopwords.words("english"))
 processed_docs = []
@@ -79,59 +96,80 @@ for doc in documents:
     tokens = [w for w in tokens if w not in stop_words and len(w) > 2]
     processed_docs.append(tokens)
 
-with st.expander("🧹 Preprocessing & Stopwords", expanded=False):
-    st.write(f"Stopwords used: {len(stop_words)} words")
-    for i, doc in enumerate(processed_docs):
-        st.write(f"Doc {i+1}: {doc}")
+# REMOVE EMPTY DOCS (IMPORTANT FIX)
+processed_docs = [doc for doc in processed_docs if len(doc) > 0]
+
+if len(processed_docs) < 2:
+    st.error("Not enough valid documents after preprocessing.")
+    st.stop()
+
+with st.expander("🧹 Preprocessing", expanded=False):
+    st.write(f"Stopwords: {len(stop_words)}")
+    st.write(processed_docs)
 
 # ==============================
-# LDA MODEL
+# LDA (CACHED)
 # ==============================
-dictionary = corpora.Dictionary(processed_docs)
-corpus = [dictionary.doc2bow(text) for text in processed_docs]
+@st.cache_resource
+def train_lda(processed_docs):
+    dictionary = corpora.Dictionary(processed_docs)
+    corpus = [dictionary.doc2bow(text) for text in processed_docs]
 
-lda_model = LdaModel(
-    corpus=corpus,
-    id2word=dictionary,
-    num_topics=2,
-    passes=10,
-    random_state=42
-)
+    model = LdaModel(
+        corpus=corpus,
+        id2word=dictionary,
+        num_topics=2,
+        passes=10,
+        random_state=42
+    )
+
+    coherence = CoherenceModel(
+        model=model,
+        texts=processed_docs,
+        dictionary=dictionary,
+        coherence="c_v"
+    ).get_coherence()
+
+    perplexity = model.log_perplexity(corpus)
+
+    return model, dictionary, corpus, coherence, perplexity
+
+
+lda_model, lda_dict, lda_corpus, lda_coherence, lda_perplexity = train_lda(processed_docs)
 
 lda_topics = lda_model.print_topics(num_topics=2, num_words=5)
 
-lda_coherence = CoherenceModel(
-    model=lda_model,
-    texts=processed_docs,
-    dictionary=dictionary,
-    coherence="c_v"
-).get_coherence()
-
-lda_perplexity = lda_model.log_perplexity(corpus)
-
 # ==============================
-# NMF MODEL
+# NMF (CACHED)
 # ==============================
-text_joined = [" ".join(doc) for doc in processed_docs]
+@st.cache_resource
+def train_nmf(processed_docs):
+    text_joined = [" ".join(doc) for doc in processed_docs]
 
-vectorizer = TfidfVectorizer()
-X = vectorizer.fit_transform(text_joined)
+    vectorizer = TfidfVectorizer()
+    X = vectorizer.fit_transform(text_joined)
 
-nmf_model = NMF(n_components=2, random_state=42)
-nmf_model.fit(X)
+    model = NMF(n_components=2, random_state=42)
+    model.fit(X)
 
-terms = vectorizer.get_feature_names_out()
+    terms = vectorizer.get_feature_names_out()
 
-nmf_topics = []
+    topics = []
+    for topic in model.components_:
+        top_idx = topic.argsort()[:-6:-1]
+        topics.append([terms[i] for i in top_idx])
 
-for topic in nmf_model.components_:
-    top_idx = topic.argsort()[:-6:-1]
-    nmf_topics.append([terms[i] for i in top_idx])
+    return model, vectorizer, topics
+
+
+nmf_model, vectorizer, nmf_topics = train_nmf(processed_docs)
+
+nmf_dictionary = corpora.Dictionary(processed_docs)
 
 nmf_coherence = CoherenceModel(
     topics=nmf_topics,
     texts=processed_docs,
-    dictionary=dictionary,
+    dictionary=nmf_dictionary,
     coherence="c_v"
 ).get_coherence()
 
@@ -147,7 +185,13 @@ col1.metric("LDA Coherence", f"{lda_coherence:.4f}")
 col2.metric("NMF Coherence", f"{nmf_coherence:.4f}")
 col3.metric("LDA Perplexity", f"{lda_perplexity:.2f}")
 
-winner = "LDA" if lda_coherence > nmf_coherence else "NMF"
+if lda_coherence > nmf_coherence:
+    winner = "LDA"
+elif nmf_coherence > lda_coherence:
+    winner = "NMF"
+else:
+    winner = "Tie"
+
 st.success(f"🏆 Best Model: {winner}")
 
 # ==============================
@@ -164,7 +208,7 @@ for i, t in enumerate(nmf_topics):
     st.write(f"Topic {i+1}: {t}")
 
 # ==============================
-# TABLE (FIXED)
+# TABLE
 # ==============================
 st.divider()
 st.subheader("📊 Comparison Table")
@@ -175,7 +219,6 @@ df_results = pd.DataFrame({
     "Perplexity": [lda_perplexity, np.nan]
 })
 
-df_display = df_results.copy()
-df_display["Perplexity"] = df_display["Perplexity"].fillna("N/A")
+df_results["Perplexity"] = df_results["Perplexity"].fillna("N/A")
 
-st.dataframe(df_display, use_container_width=True)
+st.dataframe(df_results, use_container_width=True)
